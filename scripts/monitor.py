@@ -12,18 +12,17 @@ from sib_api_v3_sdk.rest import ApiException
 
 load_dotenv()
 
+os.makedirs("output", exist_ok=True)
+
 USER = os.getenv("ENERGYSOFT_USER")
 PASSWORD = os.getenv("ENERGYSOFT_PASSWORD")
-
 
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 
-EXCEL_INPUT_FILE = "data/sitestatus (4).xlsx"
-OUTPUT_FILE = "output/anomalies_detectees.csv"
+OUTPUT_FILE = "anomalies_detectees.csv"
 ATTACHMENT_NAME = "Rapport_Anomalies_Journalier.xlsx"
-
 
 BASE_URL = "https://energysoft.app/odata/v4"
 AUTH = HTTPBasicAuth(USER, PASSWORD)
@@ -39,7 +38,6 @@ def send_email_with_excel(subject, body, df_anomalies):
         sib_api_v3_sdk.ApiClient(configuration)
     )
 
-
     temp_excel_path = "temp_anomalies.xlsx"
     df_anomalies.to_excel(temp_excel_path, index=False, engine='openpyxl')
 
@@ -47,10 +45,8 @@ def send_email_with_excel(subject, body, df_anomalies):
         excel_data = f.read()
         b64_content = base64.b64encode(excel_data).decode('utf-8')
     
-
     if os.path.exists(temp_excel_path):
         os.remove(temp_excel_path)
-
 
     attachment = sib_api_v3_sdk.SendSmtpEmailAttachment(
         content=b64_content,
@@ -62,11 +58,7 @@ def send_email_with_excel(subject, body, df_anomalies):
             "name": "PV Monitoring",
             "email": SENDER_EMAIL
         },
-        to=[
-            {
-                "email": RECEIVER_EMAIL
-            }
-        ],
+        to=[{"email": RECEIVER_EMAIL}],
         subject=subject,
         text_content=body,
         attachment=[attachment]  
@@ -79,28 +71,44 @@ def send_email_with_excel(subject, body, df_anomalies):
         print("[EMAIL] Erreur lors de l'envoi de l'e-mail :", e)
 
 
-def get_site_details(site_id):
-    url = f"{BASE_URL}/Sites('{site_id}')"
-    response = requests.get(url, auth=AUTH, headers=HEADERS)
+def execute_request_with_retry(url, params=None, method="GET"):
+    """Exécute une requête HTTP et gère l'erreur 429 (Too many requests) de l'API."""
+    while True:
+        response = requests.get(url, auth=AUTH, headers=HEADERS, params=params)
+        
+        if response.status_code == 429:
+            print("[API LIMIT] Limite de 30 req/min atteinte. Pause de 15 secondes...")
+            time.sleep(15)
+            continue
+        return response
+
+
+def get_all_sites():
+    """Récupère dynamiquement la liste de toutes les centrales depuis Energysoft."""
+    url = f"{BASE_URL}/Sites"
+    response = execute_request_with_retry(url)
     if response.status_code != 200:
-        return None
-    return response.json()
+        print(f"[ERREUR] Impossible de charger les centrales. Status: {response.status_code}")
+        return []
+    return response.json().get("value", [])
 
 
 def get_inverters(site_id):
+    """Récupère tous les onduleurs d'un site spécifique."""
     url = f"{BASE_URL}/Sites('{site_id}')/Inverters"
-    response = requests.get(url, auth=AUTH, headers=HEADERS)
+    response = execute_request_with_retry(url)
     if response.status_code != 200:
         return []
     return response.json().get("value", [])
 
 
 def get_instant_power_measure(inverter_id, date_str):
+    """Récupère la dernière mesure de puissance d'un onduleur pour la journée en cours."""
     url = f"{BASE_URL}/Inverters({inverter_id})/Measures"
     query_string = f"$top=5&$filter=MeasureType eq 'power' and date ge {date_str}"
     full_url = f"{url}?{query_string}"
     
-    response = requests.get(full_url, auth=AUTH, headers=HEADERS)
+    response = execute_request_with_retry(full_url)
     if response.status_code != 200:
         return None
     
@@ -117,53 +125,45 @@ def get_instant_power_measure(inverter_id, date_str):
 
 
 def main():
-
-    os.makedirs("output", exist_ok=True)
-    
     if not all([USER, PASSWORD, BREVO_API_KEY, SENDER_EMAIL, RECEIVER_EMAIL]):
         print("Erreur : Un ou plusieurs identifiants sont manquants dans le fichier .env.")
         return
 
-    if not os.path.exists(EXCEL_INPUT_FILE):
-        print(f"Erreur : Le fichier source '{EXCEL_INPUT_FILE}' est introuvable.")
-        return
-        
-    df_excel = pd.read_excel(EXCEL_INPUT_FILE)
-    if 'site.reference' not in df_excel.columns:
-        print("Erreur : La colonne 'site.reference' est introuvable dans le fichier Excel.")
-        return
-        
-    target_site_ids = df_excel['site.reference'].dropna().unique().tolist()
-    
     today_str = datetime.now(UTC).strftime("%Y-%m-%d")
 
-    print(f"--- DÉMARRAGE DE LA SUPERVISION EN TEMPS RÉEL ---")
+    print(f"--- DÉMARRAGE DE LA SUPERVISION EN TEMPS RÉEL (100% API) ---")
     print(f"Date d'analyse : {today_str}")
-    print(f"Nombre de centrales à analyser : {len(target_site_ids)}\n")
+    print("[API] Récupération de la liste des centrales...")
+    
+    # Étape 1 : Récupération automatique de toutes les centrales
+    all_sites = get_all_sites()
+    if not all_sites:
+        print("[FIN] Aucun site trouvé ou erreur d'authentification.")
+        return
+
+    print(f"Nombre de centrales détectées sur le compte : {len(all_sites)}\n")
 
     plant_anomaly_table = []
+    total_inverters_analysed = 0  
 
-    for site_id in target_site_ids:
-        print(f"\n[CENTRALE] Analyse du site {site_id}...")
+    for site in all_sites:
+        site_id = site.get("ID")
+        site_name = site.get("Name", "Nom Inconnu")
         
-        site = get_site_details(site_id)
-        time.sleep(2)  
-        
-        if not site:
-            print(f"  -> Site {site_id} introuvable ou inaccessible (Skip).")
+        if not site_id:
             continue
 
-        site_name = site.get("Name", "Nom Inconnu")
-        print(f"  -> Nom identifié : {site_name}")
+        print(f"\n[CENTRALE] Analyse du site : {site_name} (ID: {site_id})...")
         
         inverters = get_inverters(site_id)
-        time.sleep(2)
+        time.sleep(0.5)
 
         if not inverters:
             print("  -> Aucun onduleur trouvé sur cette centrale.")
             continue
 
         for inverter in inverters:
+            total_inverters_analysed += 1  
             inv_id = inverter.get("ID")
             inv_name = inverter.get("Name")
             
@@ -176,7 +176,6 @@ def main():
                     .replace("T", " ")
                     .replace("Z", "")
                 )
-                
                 
                 if power_value == 0.0 or power_value == 0:
                     print(f"    [ANOMALIE] '{inv_name}' à {power_value} kW à {timestamp_raw} -> CAPTURÉ")
@@ -206,40 +205,37 @@ def main():
                     "Status": "Communication Loss"
                 })
             
-            time.sleep(2)
+            time.sleep(0.5)
 
     # ==========================
-    # Global statistics
+    # Statistiques globales
     # ==========================
-    total_plants = len(target_site_ids)
-    total_inverters = len(inverters) if 'inverters' in locals() else 0
-    power_zero_count = sum(1 for a in plant_anomaly_table if a["Status"]=="Anomaly (Power = 0)")
-    communication_loss_count = sum(1 for a in plant_anomaly_table if a["Status"]=="Communication Loss")
+    total_plants = len(all_sites)
+    power_zero_count = sum(1 for a in plant_anomaly_table if a["Status"] == "Anomaly (Power = 0)")
+    communication_loss_count = sum(1 for a in plant_anomaly_table if a["Status"] == "Communication Loss")
     total_anomalies = len(plant_anomaly_table)
     plants_with_anomalies = len(set(a["Site_ID"] for a in plant_anomaly_table))
     plants_without_anomalies = total_plants - plants_with_anomalies
-    affected_percentage = (plants_with_anomalies/total_plants*100) if total_plants else 0
+    affected_percentage = (plants_with_anomalies / total_plants * 100) if total_plants else 0
 
-    print("\nSTATISTIQUES")
-    print("-"*50)
-    print(f"Total plants                : {total_plants}")
-    print(f"Power=0 anomalies           : {power_zero_count}")
-    print(f"Communication losses        : {communication_loss_count}")
-    print(f"Total anomalies             : {total_anomalies}")
-    print(f"Plants with anomalies       : {plants_with_anomalies}")
-    print(f"Plants without anomalies    : {plants_without_anomalies}")
-    print(f"Affected plants             : {affected_percentage:.2f}%")
+    print("\nSTATISTIQUES FINALES")
+    print("-" * 50)
+    print(f"Total centrales analysées   : {total_plants}")
+    print(f"Total onduleurs analysés    : {total_inverters_analysed}")
+    print(f"Anomalies Puissance = 0     : {power_zero_count}")
+    print(f"Pertes de communication     : {communication_loss_count}")
+    print(f"Total anomalies détectées   : {total_anomalies}")
+    print(f"Centrales affectées         : {plants_with_anomalies}/{total_plants} ({affected_percentage:.2f}%)")
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("ANALYSE TERMINÉE :")
-
 
     if plant_anomaly_table:
         df_new_anomalies = pd.DataFrame(plant_anomaly_table)
         
         if os.path.exists(OUTPUT_FILE):
             df_new_anomalies.to_csv(OUTPUT_FILE, mode='a', header=False, index=False, encoding='utf-8')
-            print(f"[STOCKAGE] {len(df_new_anomalies)} anomalie(s) ajoutée(s) dans le fichier historique '{OUTPUT_FILE}'")
+            print(f"[STOCKAGE] {len(df_new_anomalies)} anomalie(s) ajoutée(s) dans '{OUTPUT_FILE}'")
         else:
             df_new_anomalies.to_csv(OUTPUT_FILE, mode='w', header=True, index=False, encoding='utf-8')
             print(f"[STOCKAGE] Nouveau fichier historique créé '{OUTPUT_FILE}'")
@@ -249,18 +245,19 @@ def main():
             f"Bonjour,\n\n"
             f"Une ou plusieurs anomalies ont été détectées sur votre parc de centrales photovoltaïques lors de l'analyse du {today_str}.\n"
             f"Vous trouverez en pièce jointe le fichier Excel contenant la liste complète des {len(df_new_anomalies)} onduleurs en anomalie.\n\n"
-            f"STATISTIQUES\n"
+            f"RÉSUMÉ DES STATISTIQUES\n"
             f"-----------------------------\n"
-            f"Total plants : {total_plants}\n"
-            f"Power=0 anomalies : {power_zero_count}\n"
-            f"Communication losses : {communication_loss_count}\n"
-            f"Total anomalies : {total_anomalies}\n"
-            f"Plants affected : {plants_with_anomalies}/{total_plants} ({affected_percentage:.2f}%)\n\n"
-            f"Résumé:\n"
+            f"Total Centrales : {total_plants}\n"
+            f"Total Onduleurs Analysés : {total_inverters_analysed}\n"
+            f"Anomalies Power=0 : {power_zero_count}\n"
+            f"Pertes de Communication : {communication_loss_count}\n"
+            f"Total Anomalies : {total_anomalies}\n"
+            f"Taux d'impact parcs : {plants_with_anomalies}/{total_plants} ({affected_percentage:.2f}%)\n\n"
+            f"Détails des alertes :\n"
         )
 
         for anomaly in plant_anomaly_table:
-            body_message += f"- Centrale : {anomaly['Site_Name']} | Onduleur : {anomaly['Inverter_Name']} ({anomaly['Power_Value']} kW à {anomaly['Observation_Time']})\n"
+            body_message += f"- Centrale : {anomaly['Site_Name']} | Onduleur : {anomaly['Inverter_Name']} ({anomaly['Power_Value']} kW à {anomaly['Observation_Time']}) - Statut : {anomaly['Status']}\n"
 
         body_message += "\nCordialement,\nSystème de Supervision Automatique"
 
@@ -269,11 +266,10 @@ def main():
             body=body_message, 
             df_anomalies=df_new_anomalies
         )
-
     else:
-        print("Aucune anomalie (power=0) n'a été détectée sur l'ensemble de vos centrales.")
+        print("Aucune anomalie détectée sur l'ensemble de vos centrales.")
     
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":
