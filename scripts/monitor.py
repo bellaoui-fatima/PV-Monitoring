@@ -117,6 +117,9 @@ def get_instant_power_measure(inverter_id, date_str):
 
 
 def main():
+
+    os.makedirs("output", exist_ok=True)
+    
     if not all([USER, PASSWORD, BREVO_API_KEY, SENDER_EMAIL, RECEIVER_EMAIL]):
         print("Erreur : Un ou plusieurs identifiants sont manquants dans le fichier .env.")
         return
