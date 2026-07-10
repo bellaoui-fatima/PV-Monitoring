@@ -129,10 +129,12 @@ def main():
         print("Erreur : Un ou plusieurs identifiants sont manquants dans le fichier .env.")
         return
 
+    # Capture de la date et de l'heure exacte de l'appel API
     today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+    execution_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print(f"--- DÉMARRAGE DE LA SUPERVISION EN TEMPS RÉEL (100% API) ---")
-    print(f"Date d'analyse : {today_str}")
+    print(f"Date d'analyse : {today_str} à {execution_time_str}")
     print("[API] Récupération de la liste des centrales...")
     
     # Étape 1 : Récupération automatique de toutes les centrales
@@ -241,9 +243,12 @@ def main():
             print(f"[STOCKAGE] Nouveau fichier historique créé '{OUTPUT_FILE}'")
             
         print("\n[NOTIFICATION] Préparation de l'e-mail avec fichier joint...")
+        
+        # Ajout de l'heure d'exécution dans le corps du mail
         body_message = (
             f"Bonjour,\n\n"
             f"Une ou plusieurs anomalies ont été détectées sur votre parc de centrales photovoltaïques lors de l'analyse du {today_str}.\n"
+            f"Heure exacte de l'appel API : {execution_time_str}\n\n"
             f"Vous trouverez en pièce jointe le fichier Excel contenant la liste complète des {len(df_new_anomalies)} onduleurs en anomalie.\n\n"
             f"RÉSUMÉ DES STATISTIQUES\n"
             f"-----------------------------\n"
